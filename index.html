@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rabbit Run - React Game</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        /* 避免 Canvas 在手機上選取文字或產生預設背景藍框 */
+        canvas {
+            touch-action: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            margin: 0;
+            overflow: hidden; /* 防止手機瀏覽器晃動 */
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- 配置區 ---
+        const GAS_URL = "https://script.google.com/macros/s/AKfycbyfBYYD3jR2wwVZ8FYbBgjd5Kv9Bp8aL4Tl-hVDGy71rLCJj_W2EszsNqQC-aoG-FusKQ/exec"; 
+
+        const GRAVITY = 0.6;
+        const JUMP_FORCE = -12;
+        const INITIAL_SPEED = 6.5;
+        const SPEED_ACCEL = 0.001;
+        const GROUND_Y = 200;
+
+        function App() {
+            const [playerName, setPlayerName] = useState('');
+            const [isRegistered, setIsRegistered] = useState(false);
+            const [gameActive, setGameActive] = useState(false);
+            const [score, setScore] = useState(0);
+            const [leaderboard, setLeaderboard] = useState([]);
+            const [errorMsg, setErrorMsg] = useState('');
+            const [loading, setLoading] = useState(false);
+            
+            const canvasRef = useRef(null);
+            const requestRef = useRef(null);
+
+            const state = useRef({
+                rabbit: { x: 100, y: GROUND_Y - 40, vy: 0, isJumping: false, rotation: 0, squash: 1, stretch: 1, width: 32, height: 32 },
+                obstacles: [],
+                speed: INITIAL_SPEED,
+                score: 0,
+                lastType: null,
+                typeCount: 0,
+                spawnTimeout: null,
+                isInitialized: false
+            });
+
+            const fetchLeaderboard = async () => {
+                if (!GAS_URL) return;
+                try {
+                    const response = await fetch(`${GAS_URL}?action=getLeaderboard`);
+                    if (!response.ok) throw new Error('Network response was not ok');
+                    const data = await response.json();
+                    const sortedData = Array.isArray(data) 
+                        ? data.sort((a, b) => (b.Score || 0) - (a.Score || 0)).slice(0, 5) 
+                        : [];
+                    setLeaderboard(sortedData);
+                } catch (err) {
+                    console.error("讀取排行榜失敗:", err);
+                }
+            };
+
+            const handleRegister = async () => {
+                const trimmedName = playerName.trim();
+                if (!trimmedName) {
+                    setErrorMsg("請輸入名稱");
+                    return;
+                }
+                
+                setLoading(true);
+                setErrorMsg("");
+                try {
+                    await fetch(GAS_URL, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            action: 'register',
+                            name: trimmedName
+                        })
+                    });
+                    setIsRegistered(true);
+                    fetchLeaderboard();
+                } catch (err) {
+                    console.error("註冊過程發生錯誤", err);
+                    setIsRegistered(true);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const updateScoreInSheet = async (finalScore) => {
+                if (!GAS_URL || !isRegistered) return;
+                try {
+                    await fetch(GAS_URL, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            action: 'updateScore',
+                            name: playerName,
+                            score: Math.floor(finalScore)
+                        })
+                    });
+                    setTimeout(fetchLeaderboard, 1500);
+                } catch (err) {
+                    console.error("分數上傳失敗:", err);
+                }
+            };
+
+            const spawnObstacle = () => {
+                if (!state.current.isInitialized) return;
+
+                const s = state.current;
+                let availableTypes = ['stone'];
+                if (s.score > 300) availableTypes.push('eagle');
+                if (s.score > 600) availableTypes.push('ball');
+
+                let nextType = availableTypes[Math.floor(Math.random() * availableTypes.length)];
+                if (s.typeCount >= 2) {
+                    let filtered = availableTypes.filter(t => t !== s.lastType);
+                    nextType = filtered.length > 0 ? filtered[Math.floor(Math.random() * filtered.length)] : s.lastType;
+                }
+
+                s.typeCount = (nextType === s.lastType) ? s.typeCount + 1 : 1;
+                s.lastType = nextType;
+
+                const newObs = {
+                    type: nextType,
+                    x: 850,
+                    width: nextType === 'eagle' ? 40 : (nextType === 'ball' ? 30 : 35),
+                    height: nextType === 'eagle' ? 20 : (nextType === 'ball' ? 30 : 35),
+                    rotation: 0
+                };
+
+                if (nextType === 'eagle') {
+                    newObs.y = GROUND_Y - 70 - Math.random() * 40;
+                } else {
+                    newObs.y = GROUND_Y - newObs.height;
+                }
+
+                s.obstacles.push(newObs);
+
+                const interval = Math.max(600, 1400 - (s.score * 0.8)) + Math.random() * 700;
+                s.spawnTimeout = setTimeout(spawnObstacle, interval);
+            };
+
+            const jump = () => {
+                if (!gameActive || state.current.rabbit.isJumping) return;
+                state.current.rabbit.vy = JUMP_FORCE;
+                state.current.rabbit.isJumping = true;
+                state.current.rabbit.squash = 1.3;
+                state.current.rabbit.stretch = 0.7;
+            };
+
+            const resetGame = () => {
+                if (state.current.spawnTimeout) clearTimeout(state.current.spawnTimeout);
+                
+                state.current = {
+                    rabbit: { x: 100, y: GROUND_Y - 40, vy: 0, isJumping: false, rotation: 0, squash: 1, stretch: 1, width: 32, height: 32 },
+                    obstacles: [],
+                    speed: INITIAL_SPEED,
+                    score: 0,
+                    lastType: null,
+                    typeCount: 0,
+                    spawnTimeout: null,
+                    isInitialized: true
+                };
+                
+                setScore(0);
+                setGameActive(true);
+                setTimeout(spawnObstacle, 1000);
+            };
+
+            useEffect(() => {
+                if (!gameActive) return;
+
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                
+                const loop = () => {
+                    if (!gameActive) return;
+                    const s = state.current;
+                    
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                    ctx.strokeStyle = '#222';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath(); ctx.moveTo(0, GROUND_Y); ctx.lineTo(800, GROUND_Y); ctx.stroke();
+
+                    const r = s.rabbit;
+                    r.y += r.vy;
+                    r.vy += GRAVITY;
+                    
+                    if (r.isJumping) {
+                        r.rotation += 0.15;
+                        r.squash = r.vy < 0 ? 0.85 : 1;
+                        r.stretch = r.vy < 0 ? 1.15 : 1;
+                    }
+                    
+                    if (r.y > GROUND_Y - 40) {
+                        r.y = GROUND_Y - 40; 
+                        r.vy = 0;
+                        if (r.isJumping) { r.squash = 1.4; r.stretch = 0.6; }
+                        r.isJumping = false; 
+                        r.rotation = 0;
+                        r.squash += (1 - r.squash) * 0.2;
+                        r.stretch += (1 - r.stretch) * 0.2;
+                    }
+
+                    ctx.save();
+                    ctx.translate(r.x + 16, r.y + 16);
+                    ctx.scale(r.squash, r.stretch);
+                    if (r.isJumping) ctx.rotate(r.rotation);
+                    ctx.fillStyle = '#222';
+                    ctx.beginPath(); ctx.ellipse(0, 6, 16, 13, 0, 0, Math.PI * 2); ctx.fill();
+                    ctx.beginPath(); ctx.arc(9, -4, 10, 0, Math.PI * 2); ctx.fill();
+                    ctx.fillRect(1, -24, 5, 14); ctx.fillRect(11, -24, 5, 14);
+                    ctx.fillStyle = '#fff'; ctx.fillRect(13, -8, 3, 3);
+                    ctx.restore();
+
+                    for (let i = s.obstacles.length - 1; i >= 0; i--) {
+                        const obs = s.obstacles[i];
+                        const moveSpeed = s.speed + (obs.type === 'eagle' ? 1.5 : (obs.type === 'ball' ? 3.0 : 0));
+                        obs.x -= moveSpeed;
+                        
+                        ctx.fillStyle = '#222';
+                        if (obs.type === 'stone') {
+                            ctx.beginPath(); 
+                            ctx.moveTo(obs.x, obs.y + obs.height); 
+                            ctx.lineTo(obs.x + obs.width * 0.5, obs.y); 
+                            ctx.lineTo(obs.x + obs.width, obs.y + obs.height); 
+                            ctx.fill();
+                        } else if (obs.type === 'eagle') {
+                            ctx.fillRect(obs.x, obs.y + 5, 30, 10); 
+                            ctx.fillRect(obs.x + 30, obs.y + 7, 10, 4);
+                            const wingY = Math.sin(Date.now() / 100) * 5;
+                            ctx.fillRect(obs.x + 5, obs.y + wingY, 10, 5);
+                        } else if (obs.type === 'ball') {
+                            ctx.save(); 
+                            ctx.translate(obs.x + obs.width/2, obs.y + obs.height/2); 
+                            obs.rotation -= 0.2; 
+                            ctx.rotate(obs.rotation);
+                            ctx.strokeRect(-obs.width/2, -obs.height/2, obs.width, obs.height); 
+                            ctx.restore();
+                        }
+
+                        const rabbitHitbox = { x: r.x + 10, y: r.y + 5, w: 20, h: 30 };
+                        if (rabbitHitbox.x < obs.x + obs.width &&
+                            rabbitHitbox.x + rabbitHitbox.w > obs.x &&
+                            rabbitHitbox.y < obs.y + obs.height &&
+                            rabbitHitbox.y + rabbitHitbox.h > obs.y) {
+                            
+                            state.current.isInitialized = false;
+                            setGameActive(false);
+                            updateScoreInSheet(s.score);
+                            return;
+                        }
+                        
+                        if (obs.x < -100) s.obstacles.splice(i, 1);
+                    }
+
+                    s.score += 0.15;
+                    s.speed += SPEED_ACCEL;
+                    setScore(Math.floor(s.score));
+                    requestRef.current = requestAnimationFrame(loop);
+                };
+
+                requestRef.current = requestAnimationFrame(loop);
+                return () => {
+                    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+                };
+            }, [gameActive]);
+
+            useEffect(() => {
+                const handleKey = (e) => { if (e.code === 'Space' || e.code === 'ArrowUp') jump(); };
+                window.addEventListener('keydown', handleKey);
+                return () => window.removeEventListener('keydown', handleKey);
+            }, [gameActive]);
+
+            return (
+                <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4 font-mono select-none">
+                    <div className="relative w-full max-w-3xl bg-white border-b-4 border-black shadow-2xl overflow-hidden" style={{ height: '250px' }}>
+                        <canvas 
+                            ref={canvasRef} 
+                            width={800} 
+                            height={250} 
+                            className="w-full h-full block cursor-pointer" 
+                            onMouseDown={jump} 
+                            onTouchStart={jump} 
+                        />
+                        
+                        <div className="absolute top-4 right-4 text-right pointer-events-none text-lg font-bold">
+                            <div>HI-SCORE: {String(score).padStart(5, '0')}</div>
+                            <div className="text-sm text-gray-400">{playerName || 'Guest'}</div>
+                        </div>
+
+                        {!isRegistered && (
+                            <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center z-50 p-6 text-center">
+                                <h1 className="text-3xl font-black mb-2 tracking-tighter">RABBIT RUN</h1>
+                                <p className="text-xs text-gray-400 mb-8 font-sans">連接至 Google Sheets 排行榜</p>
+                                <input 
+                                    type="text" 
+                                    value={playerName} 
+                                    onChange={(e) => setPlayerName(e.target.value.slice(0, 10))}
+                                    placeholder="輸入暱稱..."
+                                    className="border-2 border-black p-3 mb-4 text-center text-xl outline-none focus:ring-2 ring-gray-200 w-64 bg-transparent"
+                                />
+                                {errorMsg && <p className="text-red-500 text-xs mb-4">{errorMsg}</p>}
+                                <button 
+                                    onClick={handleRegister}
+                                    disabled={loading}
+                                    className="bg-black text-white px-12 py-3 font-bold hover:bg-gray-800 transition-all active:scale-95"
+                                >
+                                    {loading ? "連線中..." : "開始冒險"}
+                                </button>
+                            </div>
+                        )}
+
+                        {isRegistered && !gameActive && (
+                            <div className="absolute inset-0 bg-white/90 flex flex-row items-center justify-center z-40 p-4 gap-8">
+                                <div className="flex flex-col items-center">
+                                    <h2 className="text-xl font-bold mb-1 opacity-50">GAME OVER</h2>
+                                    <p className="text-6xl font-black mb-6">{score}</p>
+                                    <button onClick={resetGame} className="bg-black text-white px-10 py-4 font-bold hover:bg-gray-800 transition-all active:scale-95 shadow-lg">
+                                        再次挑戰
+                                    </button>
+                                </div>
+                                
+                                <div className="w-64 bg-white p-4 border-2 border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
+                                    <h3 className="text-center font-black border-b-2 border-black mb-3 pb-1 text-xs tracking-widest">LEADERBOARD</h3>
+                                    {leaderboard.length > 0 ? (
+                                        <table className="w-full text-[11px]">
+                                            <tbody>
+                                                {leaderboard.map((entry, idx) => (
+                                                    <tr key={idx} className={entry.PlayerName === playerName ? 'bg-black text-white' : ''}>
+                                                        <td className="py-1 px-1 w-6">{idx + 1}.</td>
+                                                        <td className="py-1 truncate max-w-[80px]">{entry.PlayerName}</td>
+                                                        <td className="py-1 text-right font-bold px-1">{Math.floor(entry.Score)}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    ) : (
+                                        <div className="text-center py-4 text-[10px] text-gray-400">更新榜單中...</div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                    <div className="mt-6 flex gap-4 text-gray-400 text-[10px] uppercase tracking-widest">
+                        <span>Space to Jump</span>
+                        <span>•</span>
+                        <span>Cloud Sync Enabled</span>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
